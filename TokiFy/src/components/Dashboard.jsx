@@ -1,4 +1,7 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { supabase } from "../lib/supabaseClient";
+import { runAiOptimizer } from "../lib/aiOptimizer";
+import { connectWallet, switchToMumbai, getUSDTBalance, depositToPool, withdrawFromPool, getPoolBalance } from "../lib/web3";
 
 /* ─── DESIGN TOKENS ─── */
 const C = {
@@ -269,21 +272,89 @@ function PageHome({ setPage, setActiveTx, walletBalance, txHistory, liveRates, r
 }
 
 /* ═══════════════════════════════════════════════
-   PAGE: ADD MONEY
+   PAGE: ADD MONEY  (Real Razorpay + Supabase)
 ═══════════════════════════════════════════════ */
+const SUPABASE_FUNC_URL = "https://uszudaepofmdglzvsxik.supabase.co/functions/v1";
+
+function loadRazorpayScript() {
+  return new Promise((resolve) => {
+    if (document.getElementById("razorpay-script")) { resolve(true); return; }
+    const s = document.createElement("script");
+    s.id = "razorpay-script";
+    s.src = "https://checkout.razorpay.com/v1/checkout.js";
+    s.onload = () => resolve(true);
+    s.onerror = () => resolve(false);
+    document.body.appendChild(s);
+  });
+}
+
 function PageAddMoney({ setPage, onAddFunds }) {
-  const [step, setStep] = useState(1); // 1=amount, 2=gateway redirect, 3=processing, 4=success
+  const [step, setStep] = useState(1); // 1=amount, 2=pay, 3=processing, 4=success, 5=error
   const [amount, setAmount] = useState("");
+  const [payError, setPayError] = useState("");
 
   const amt = parseFloat(amount) || 0;
 
-  function handleGatewayRedirect() {
+  async function handleRazorpayCheckout() {
+    setPayError("");
+    const loaded = await loadRazorpayScript();
+    if (!loaded) { setPayError("Failed to load Razorpay. Check your connection."); return; }
+
     setStep(3);
-    // Simulate Razorpay payment processing
-    setTimeout(() => {
-      setStep(4);
-      onAddFunds(amt);
-    }, 3000);
+    try {
+      // 2. Create order on backend using supabase client
+      const { data: order, error: invokeErr } = await supabase.functions.invoke("create-razorpay-order", {
+        body: { amount: amt },
+      });
+
+      if (invokeErr || !order?.order_id) {
+        setPayError(order?.error || invokeErr?.message || "Failed to create order");
+        setStep(2); return;
+      }
+
+      setStep(2); // show checkout
+
+      // 3. Open Razorpay modal
+      const rzp = new window.Razorpay({
+        key: order.key_id || "rzp_test_Sa9AsT2bFXZnuv",
+        amount: order.amount,
+        currency: order.currency || "INR",
+        name: "Tokify",
+        description: "Platform Wallet Top-up",
+        order_id: order.order_id,
+        theme: { color: "#e8210a" },
+        handler: async function (response) {
+          setStep(3);
+          try {
+            // 4. Verify signature on backend using supabase client
+            const { data: verified, error: verifyInvokeErr } = await supabase.functions.invoke("verify-payment", {
+              body: {
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+                amount: amt,
+              },
+            });
+
+            if (!verifyInvokeErr && verified?.success) {
+              onAddFunds(amt); // update local state
+              setStep(4);
+            } else {
+              setPayError(verified?.error || verifyInvokeErr?.message || "Payment verification failed");
+              setStep(5);
+            }
+          } catch (err) {
+            setPayError("Verification network error. Contact support.");
+            setStep(5);
+          }
+        },
+        modal: { ondismiss: () => { setStep(1); } },
+      });
+      rzp.open();
+    } catch (e) {
+      setPayError(e.message || "Unexpected error");
+      setStep(5);
+    }
   }
 
   return (
@@ -369,10 +440,10 @@ function PageAddMoney({ setPage, onAddFunds }) {
             )}
 
             <button style={{ ...brandBtn, width:"100%", padding:18, opacity: amt > 0 ? 1 : 0.45 }}
-              disabled={amt <= 0} onClick={() => amt > 0 && setStep(2)}
+              disabled={amt <= 0} onClick={() => amt > 0 && handleRazorpayCheckout()}
               onMouseEnter={e => amt>0 && (e.currentTarget.style.transform="translateY(-2px)", e.currentTarget.style.boxShadow="0 12px 36px rgba(232,33,10,0.38)")}
               onMouseLeave={e => { e.currentTarget.style.transform=""; e.currentTarget.style.boxShadow=""; }}>
-              Continue to Payment →
+              Pay ₹{amt > 0 ? amt.toLocaleString("en-IN") : "—"} via Razorpay →
             </button>
           </div>
         )}
@@ -439,14 +510,25 @@ function PageAddMoney({ setPage, onAddFunds }) {
               You will be redirected to Razorpay's secure checkout to complete the payment of <strong style={{ color:"#fff" }}>₹{amt.toLocaleString("en-IN")}</strong>. Once successful, funds will be instantly credited to your Tokify wallet.
             </div>
 
+            {payError && <div style={{ color:"#f87171", fontSize:12, fontFamily:"'Syne',sans-serif", textAlign:"center", marginBottom:12 }}>{payError}</div>}
             <div style={{ display:"flex", gap:10 }}>
               <button style={{ ...ghostBtn, flex:1, padding:16 }} onClick={() => setStep(1)}>Back</button>
-              <button style={{ ...brandBtn, flex:2, padding:16 }} onClick={handleGatewayRedirect}
+              <button style={{ ...brandBtn, flex:2, padding:16 }} onClick={handleRazorpayCheckout}
                 onMouseEnter={e => { e.currentTarget.style.transform="translateY(-2px)"; e.currentTarget.style.boxShadow="0 12px 36px rgba(232,33,10,0.38)"; }}
                 onMouseLeave={e => { e.currentTarget.style.transform=""; e.currentTarget.style.boxShadow=""; }}>
                 Pay ₹{amt.toLocaleString("en-IN")} via Razorpay →
               </button>
             </div>
+          </div>
+        )}
+
+        {/* STEP 5 — ERROR */}
+        {step === 5 && (
+          <div style={{ textAlign:"center", paddingTop:32 }}>
+            <div style={{ width:80, height:80, borderRadius:"50%", margin:"0 auto 20px", background:"rgba(248,113,113,0.1)", border:"2px solid rgba(248,113,113,0.3)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:36, color:"#f87171" }}>✗</div>
+            <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:28, letterSpacing:".05em", marginBottom:8 }}>Payment Failed</div>
+            <div style={{ fontSize:13, color:C.muted, marginBottom:24, lineHeight:1.7 }}>{payError}</div>
+            <button style={{ ...brandBtn, width:"100%", padding:16 }} onClick={() => { setStep(1); setPayError(""); }}>Try Again</button>
           </div>
         )}
 
@@ -1366,162 +1448,135 @@ function PageTokenWallet({ setPage, tokenStore }) {
 }
 
 /* ═══════════════════════════════════════════════
-   PAGE: SEND TOKENS
+   PAGE: SEND TOKENS (DeFi + AI Optimizer)
 ═══════════════════════════════════════════════ */
 function PageSendTokens({ setPage, tokenStore }) {
+  const [amount, setAmount] = useState("");
+  const [recipient, setRecipient] = useState("");
+  const [aiResult, setAiResult] = useState(null);
+  const [runningAi, setRunningAi] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [ethAddress, setEthAddress] = useState("");
+
   const totalTokens = tokenStore.reduce((sum, t) => sum + parseFloat(t.amt), 0);
 
+  // 1. Connect wallet first if not connected
+  useEffect(() => {
+    connectWallet()
+      .then((w) => {
+        setEthAddress(w.address);
+        return switchToMumbai(); // Ensure network
+      })
+      .catch(err => {
+        console.error("Wallet error:", err);
+      });
+  }, []);
+
+  const handleRunAi = () => {
+    if (!amount || !recipient) return;
+    setRunningAi(true);
+    setAiResult(null);
+
+    // Add slight delay for "typing" effect
+    setTimeout(() => {
+      const best = runAiOptimizer(parseFloat(amount), "INR", "USD");
+      setAiResult(best);
+      setRunningAi(false);
+    }, 1500);
+  };
+
+  const handleSend = async () => {
+    if (!aiResult) return;
+    setSending(true);
+
+    try {
+      if (aiResult.route === "defi") {
+        // DeFi Route — Send USDT into pool (simulate on-ramp)
+        const signer = await (await import("../lib/web3")).getSigner();
+        if (!signer) throw new Error("Wallet not connected");
+        await depositToPool(signer, parseFloat(amount));
+      } else {
+        // Traditional route simulated sending
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      setPage("home"); // Success!
+    } catch (err) {
+      console.error(err);
+      alert("Transfer failed: " + err.message);
+    } finally {
+      setSending(false);
+    }
+  };
+
   return (
-    <div style={{
-      position: "fixed", inset: 0, zIndex: 50,
-      background: "#000000",           /* pure black — the robot's black bg merges with this */
-      display: "flex", flexDirection: "column",
-      overflow: "hidden",
-    }}>
-
-      {/* ── VIDEO BACKGROUND ──
-          mix-blend-mode: screen makes all black pixels (0,0,0) fully transparent.
-          The orange robot colours are preserved exactly; only the black bg disappears.   */}
-      <video
-        src="/tokify-robot.mp4"
-        autoPlay
-        loop
-        muted
-        playsInline
-        style={{
-          position: "absolute", inset: 0,
-          width: "100%", height: "100%",
-          objectFit: "cover",
-          mixBlendMode: "screen",       /* 🔑 black → transparent, orange stays orange */
-          zIndex: 0,
-          pointerEvents: "none",
-        }}
-      />
-
-      {/* ── Subtle vignette so content is readable ── */}
-      <div style={{
-        position: "absolute", inset: 0, zIndex: 1, pointerEvents: "none",
-        background: "radial-gradient(ellipse at center, transparent 30%, rgba(0,0,0,0.55) 100%)",
-      }} />
-
-      {/* ── CONTENT layer — sits above video ── */}
-      <div style={{
-        position: "relative", zIndex: 2,
-        display: "flex", flexDirection: "column",
-        flex: 1, overflowY: "auto",
-        paddingBottom: 24,
-      }}>
-
-        {/* Header */}
-        <div style={{ padding:"28px 24px 0", display:"flex", alignItems:"center", gap:14 }}>
-          <button onClick={() => setPage("tokenWallet")}
-            style={{
-              background: "rgba(0,0,0,0.6)", border:"1px solid rgba(255,255,255,0.2)",
-              color:"rgba(255,255,255,0.8)", borderRadius:"50%",
-              width:38, height:38, fontSize:18, cursor:"pointer",
-              display:"flex", alignItems:"center", justifyContent:"center",
-              backdropFilter:"blur(10px)", WebkitBackdropFilter:"blur(10px)",
-              flexShrink: 0,
-            }}>←</button>
-          <div>
-            <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:28, letterSpacing:".05em",
-              textShadow:"0 0 20px rgba(245,106,0,0.6)" }}>Send Tokens</div>
-            <div style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>Transfer your stablecoin tokens</div>
-          </div>
+    <div style={{ flex: 1, overflowY: "auto", paddingBottom: 24 }}>
+      <div style={{ padding:"28px 24px 0", display:"flex", alignItems:"center", gap:14 }}>
+        <button onClick={() => setPage("tokenWallet")}
+          style={{ ...ghostBtn, width:38, height:38, padding:0, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center" }}>←</button>
+        <div>
+          <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:28, letterSpacing:".05em" }}>Send & Optimize</div>
+          <div style={{ fontSize:11, color:C.muted }}>AI-powered transfer routing</div>
         </div>
+      </div>
 
-        {/* Available tokens pill */}
-        <div style={{ margin:"22px 20px 0" }}>
-          <div style={{
-            borderRadius:14, padding:"14px 18px",
-            background:"rgba(0,0,0,0.55)",
-            border:"1px solid rgba(245,106,0,0.35)",
-            backdropFilter:"blur(14px)", WebkitBackdropFilter:"blur(14px)",
-            display:"flex", justifyContent:"space-between", alignItems:"center",
-          }}>
-            <span style={{ fontSize:12, color:"rgba(255,255,255,0.5)" }}>Available Tokens</span>
-            <div style={{ textAlign:"right" }}>
-              <span style={{ fontFamily:"'Bebas Neue',cursive", fontSize:22, letterSpacing:".04em",
-                color:C.orange, textShadow:"0 0 16px rgba(245,106,0,0.7)" }}>{totalTokens.toFixed(4)}</span>
-              <span style={{ fontSize:10, color:"rgba(255,255,255,0.35)", marginLeft:6 }}>TKF</span>
-            </div>
+      <div style={{ padding: "24px 20px" }}>
+        {/* Wallet check */}
+        {!ethAddress && (
+          <div style={{ background: "rgba(232,33,10,0.1)", border: "1px solid rgba(232,33,10,0.3)", padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 12, color: "#ff5555" }}>
+            ⚠ MetaMask not connected. Web3 features disabled.
           </div>
-        </div>
+        )}
 
-        {/* Spacer so content floats to bottom — robot fills the middle */}
-        <div style={{ flex: 1 }} />
+        <label style={lbl}>Send Amount (TKF-USD)</label>
+        <input type="number" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} style={{ ...inp, fontSize: 24, fontWeight: 700, marginBottom: 16 }} />
 
-        {/* Bottom card with info + coming soon */}
-        <div style={{ margin:"0 20px 0" }}>
-          <div style={{
-            borderRadius:22, padding:"28px 24px",
-            background:"rgba(0,0,0,0.7)",
-            border:"1px solid rgba(245,106,0,0.3)",
-            backdropFilter:"blur(20px)", WebkitBackdropFilter:"blur(20px)",
-            textAlign:"center",
-            boxShadow:"0 -8px 40px rgba(0,0,0,0.5)",
-          }}>
-            <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:26, letterSpacing:".06em", marginBottom:8,
-              textShadow:"0 0 20px rgba(245,106,0,0.5)" }}>
-              Send Tokens
-            </div>
-            <div style={{ fontSize:13, color:"rgba(255,255,255,0.5)", lineHeight:1.7, marginBottom:20 }}>
-              Transfer TKF stablecoin tokens directly to any Polygon wallet address or another Tokify user.
-            </div>
+        <label style={lbl}>Recipient Wallet or Bank</label>
+        <input type="text" placeholder="0x... or Account Name" value={recipient} onChange={e => setRecipient(e.target.value)} style={{ ...inp, marginBottom: 24 }} />
 
-            {/* Feature chips */}
-            <div style={{ display:"flex", flexWrap:"wrap", gap:8, justifyContent:"center", marginBottom:22 }}>
-              {["⚡ Instant","🔒 Secure","🌍 Cross-border","⛓️ On-chain"].map(f => (
-                <div key={f} style={{
-                  padding:"5px 12px",
-                  background:"rgba(245,106,0,0.08)",
-                  border:"1px solid rgba(245,106,0,0.25)",
-                  borderRadius:20, fontSize:11, color:"rgba(255,255,255,0.6)",
-                }}>{f}</div>
-              ))}
-            </div>
+        {!aiResult && !runningAi && (
+          <button style={{ ...brandBtn, opacity: amount && recipient ? 1 : 0.5 }} disabled={!amount || !recipient} onClick={handleRunAi}>
+            🤖 Run AI Path Optimizer
+          </button>
+        )}
 
-            {/* Coming soon badge */}
-            <div style={{
-              display:"inline-flex", alignItems:"center", gap:8, padding:"10px 24px",
-              background:"linear-gradient(135deg,rgba(232,33,10,0.2),rgba(245,106,0,0.12))",
-              border:"1px solid rgba(245,106,0,0.45)", borderRadius:30,
-              fontFamily:"'Bebas Neue',cursive", fontSize:15, letterSpacing:".18em", color:C.orange,
-              boxShadow:"0 0 20px rgba(232,33,10,0.2)",
-              textShadow:"0 0 12px rgba(245,106,0,0.6)",
-              marginBottom: 20,
-            }}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="12" y1="8" x2="12" y2="12"/>
-                <line x1="12" y1="16" x2="12.01" y2="16"/>
-              </svg>
-              Coming Soon
+        {runningAi && (
+          <div style={{ ...glass, borderRadius: 16, padding: "20px", textAlign: "center" }}>
+            <div style={{ fontSize: 24, animation: "spin 1s linear infinite", marginBottom: 10 }}>⚙️</div>
+            <div style={{ fontFamily: "'Bebas Neue',cursive", fontSize: 20, letterSpacing: ".05em" }}>Analyzing Liquidity...</div>
+            <div style={{ fontSize: 11, color: C.muted }}>Comparing Web2 SWIFT vs Web3 DeFi protocols</div>
+          </div>
+        )}
+
+        {aiResult && !runningAi && (
+          <div style={{ ...glass, borderRadius: 16, padding: "20px", border: "1px solid rgba(74,222,128,0.3)" }}>
+            <div style={{ fontSize: 10, letterSpacing: ".3em", color: "#4ade80", textTransform: "uppercase", marginBottom: 10 }}>AI Recommendation</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontFamily: "'Bebas Neue',cursive", fontSize: 28, color: "#fff" }}>
+                {aiResult.route === "defi" ? "DeFi Stablecoin" : "SWIFT Wire"}
+              </div>
+              <div style={{ background: "rgba(74,222,128,0.1)", color: "#4ade80", padding: "4px 8px", borderRadius: 4, fontSize: 11, fontWeight: 700 }}>
+                BEST ROUTE
+              </div>
             </div>
 
-            {/* Back button */}
-            <button
-              onClick={() => setPage("tokenWallet")}
-              style={{
-                display:"block", width:"100%", padding:"14px 0",
-                background:"rgba(255,255,255,0.06)",
-                border:"1px solid rgba(255,255,255,0.15)",
-                color:"rgba(255,255,255,0.7)", borderRadius:14,
-                fontFamily:"'Syne',sans-serif", fontWeight:700,
-                fontSize:13, letterSpacing:".1em", textTransform:"uppercase",
-                cursor:"pointer",
-                backdropFilter:"blur(8px)", WebkitBackdropFilter:"blur(8px)",
-                transition:"background .2s, transform .2s",
-              }}
-              onMouseEnter={e => { e.currentTarget.style.background="rgba(255,255,255,0.1)"; e.currentTarget.style.transform="translateY(-2px)"; }}
-              onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,0.06)"; e.currentTarget.style.transform=""; }}>
-              ← Back to Wallet
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+              <div style={{ background: "rgba(0,0,0,0.4)", padding: 12, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", marginBottom: 4 }}>Est. Delivery</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>{aiResult.eta}</div>
+              </div>
+              <div style={{ background: "rgba(0,0,0,0.4)", padding: 12, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", marginBottom: 4 }}>Fee</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#4ade80" }}>{aiResult.fee}</div>
+              </div>
+            </div>
+
+            <button style={{ ...brandBtn, width: "100%", opacity: sending ? 0.7 : 1 }} disabled={sending || (aiResult.route === "defi" && !ethAddress)} onClick={handleSend}>
+              {sending ? "⏳ Executing..." : `Send via ${aiResult.protocol || "SWIFT"} →`}
             </button>
           </div>
-        </div>
-
-        <div style={{ height: 16 }} />
+        )}
       </div>
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
@@ -1807,7 +1862,10 @@ function PageProfile({ onLogout, walletBalance }) {
       </div>
       <div style={{ margin:"20px 20px 0" }}>
         <button style={{ ...ghostBtn, width:"100%", padding:16, color:"#f87171", borderColor:"rgba(248,113,113,0.2)" }}
-          onClick={onLogout}
+          onClick={async () => {
+            await supabase.auth.signOut();
+            onLogout();
+          }}
           onMouseEnter={e => { e.currentTarget.style.background="rgba(248,113,113,0.08)"; e.currentTarget.style.borderColor="rgba(248,113,113,0.35)"; }}
           onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,0.05)"; e.currentTarget.style.borderColor="rgba(248,113,113,0.2)"; }}>
           Log Out
