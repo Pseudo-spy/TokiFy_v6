@@ -3,7 +3,7 @@
 A Web3-powered fintech platform enabling secure cross-border remittances, identity verification, and seamless payment processing.
 
 <div align="center">
-  <img src="Screenshot%202026-03-03%20133142.png" width="1200" alt="WheelRank Banner"/>
+  <img src="" width="1200" alt="TokiFy Banner"/>
 </div>
 
 ---
