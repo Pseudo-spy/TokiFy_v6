@@ -993,7 +993,7 @@ function PageTokenizing({ setPage, tx, onStoreInWallet }) {
       {/* ── VIDEO LAYER (orange+black tinted, looping) ── */}
       <video
         ref={videoRef}
-        src="/tokify-coins.mp4"
+        src="/WhatsApp Video 2026-04-07 at 11.58.45 AM.mp4"
         autoPlay
         loop
         muted
