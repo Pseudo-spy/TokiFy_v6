@@ -1,4 +1,4 @@
-  # 🚀 TokiFy v6
+  # 🚀 TokiFy (AI Powered & Web3 based secured and fast Borderless Remittance System )
 
 A Web3-powered fintech platform enabling secure cross-border remittances, identity verification, and seamless payment processing.
 
